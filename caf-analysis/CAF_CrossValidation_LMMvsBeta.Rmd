@@ -1,0 +1,272 @@
+---
+title: "RegressionsComparissons"
+output: html_document
+date: "2023-11-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rstatix)
+library(glmmTMB)
+library(lme4)
+library(lmerTest)
+library(pROC)
+library(caret)
+library(ggeffects)
+```
+
+# *Utility
+```{r utility functions, echo = FALSE}
+rm(list=ls())
+
+
+###############################
+## Cross-Validation Function ##
+
+cross.validation <- function(data, modelBetaFit, modelLinearFit, k = 10, seed = seed, save = FALSE){
+  set.seed(seed) #Setting seed
+
+
+  #Create folds based on the vincentized data
+  folds <- createFolds(data$AccAdj, k = k)
+  
+  mse_beta <- numeric(length(folds))
+  mse_linear <- numeric(length(folds))
+  
+  #Initialize dataframe to save results
+  mse_results <- data.frame(Fold = integer(), MSE_Beta = numeric(), MSE_Linear = numeric())
+  
+  for(i in seq_along(folds)){
+    
+    #Split vincentized data into training and testing
+    test_indices_vincentized <- folds[[i]]
+    test_set_vincentized <- data[test_indices_vincentized, ]
+    training_set_vincentized <- data[-test_indices_vincentized, ]
+    
+    #Refit models on training_set
+    refitBeta <- update(modelBetaFit, data = training_set_vincentized)
+    refitLinear <- update(modelLinearFit, data = training_set_vincentized)
+    
+    #Make predictions on test_set
+    predictions_beta <- predict(refitBeta, newdata = test_set_vincentized, type = "response")
+    predictions_linear <- predict(refitLinear, newdata = test_set_vincentized, type = "response")
+    
+    #Calculate MSE for each fold
+    mse_beta[i] <- mean((test_set_vincentized$AccAdj - predictions_beta)^2)
+    mse_linear[i] <- mean((test_set_vincentized$Acc - predictions_linear)^2)
+    
+    
+    #Append fold results to mse_results dataframe
+    mse_results <- rbind(mse_results, data.frame(Fold = i, MSE_Beta = mse_beta[i], MSE_Linear = mse_linear[i]))
+  }
+  
+  #Save if save = TRUE
+  if(save){
+    nameKFold <- paste0("CAF_Analyses/models/comparison/k-fold_results_seed",seed,".csv")
+    
+    write.table(mse_results, file =  nameKFold, sep = ";", col.names = T, dec = ",", row.names = F)
+  }
+  
+  
+  #Calculate mean MSE across all folds
+  mean_mse_beta <- mean(mse_beta)
+  mean_mse_linear <- mean(mse_linear)
+  
+  diff_linear_beta <- mean_mse_beta - mean_mse_linear
+  diff_binomial_beta <- mean_mse_beta - mean_mse_binomial
+  
+  out <- data.frame(MSE_Beta = round(mean_mse_beta, 4), MSE_Linear = round(mean_mse_linear, 4))
+  
+  return(out)
+}
+
+
+
+
+#############
+## PLOTS ###
+prediction.plot <- function(data, modelLinear, modelBeta, factors){
+  
+  #Predictions
+  predicted_effects_linear <- ggpredict(modelLinear, terms = factors)
+  predicted_effects_beta <- ggpredict(modelBeta, terms = factors)
+  
+  
+  #Converting into dataframe
+  predicted_df_linear <- as.data.frame(predicted_effects_linear) %>% rename(!!sym(factors[1]) := x, Congruency = group, Bin = facet)
+  predicted_df_beta <- as.data.frame(predicted_effects_beta) %>% rename(!!sym(factors[1]):=x, Congruency = group, Bin = facet)
+  
+  
+  #Setting empirical and predicted datasets
+  empirical_data <- data %>% group_by(Study, across(all_of(factors))) %>% reframe(Acc = mean(Acc)) %>% group_by(across(all_of(factors))) %>% reframe(Acc = mean(Acc)) %>% mutate(DataType = "Observed") %>% convert_as_factor(DataType)
+  
+  predicted_data_linear <- predicted_df_linear %>% select(!!sym(factors[1]), Congruency, Bin, Acc = predicted) %>% mutate(DataType = "Predicted") %>% convert_as_factor(DataType)
+  
+  predicted_data_beta <- predicted_df_beta %>% select(!!sym(factors[1]), Congruency, Bin, Acc = predicted) %>% mutate(DataType = "Predicted") %>% convert_as_factor(DataType)
+  
+  
+  #Merging datasets
+  combined_data_beta <- rbind(predicted_data_beta, empirical_data)
+  
+  combined_data_linear <- rbind(predicted_data_linear, empirical_data)
+  
+  
+  
+  # Plot
+  facet_var <- factors[!factors %in% c("Congruency", "Bin")][1]
+  
+  
+  plot_beta <- ggplot(combined_data_beta, aes(x = Bin, y = Acc, color = Congruency, shape = DataType)) + geom_point(size = 2) + facet_wrap(~get(facet_var)) + labs(y = "Accuracy", x = "", caption = "Beta Regression") + scale_color_manual(values = c("darkblue", "darkred")) +  scale_shape_manual(values = c("Predicted" = 3, "Observed" = 16)) + theme_bw(base_size = 11) + ylim(0.80, 1.00)
+
+  plot_linear <- ggplot(combined_data_linear, aes(x = Bin, y = Acc, color = Congruency, shape = DataType)) + geom_point(size = 2) + facet_wrap(~get(facet_var)) + labs(y = "Accuracy", x = "", caption = "Linear Regression") + scale_color_manual(values = c("darkblue", "darkred")) +  scale_shape_manual(values = c("Predicted" = 3, "Observed" = 16)) + theme_bw(base_size = 11) + ylim(0.80, 1.00)
+  
+  
+  return(list(Beta = plot_beta, Linear = plot_linear))
+}
+```
+
+
+
+# Load Dataset
+```{r load and set, echo = FALSE}
+#Load Datasets divided by Bins 
+
+## 5 Bins datasets
+df.MA_caf <- read.csv("Datasets/modelA_df.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetCategory, Congruency, Study, Bin) %>% reorder_levels(TargetCategory, order = c("Social", "NonSocial")) %>% as.data.frame()
+
+df.MB_caf <- read.csv("Datasets/modelB_df.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, Bin) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows")) %>% as.data.frame()
+
+df.MC_caf <- read.csv("Datasets/modelC_df.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, Expression, Congruency, Study, Bin) %>% as.data.frame()
+```
+
+
+
+
+# .................
+# MODELS
+
+## Linear Regression 
+```{r linear models, echo = FALSE}
+#-------------------
+#LINEAR MIXED REGRESSION
+#------------------
+## MODEL A: Global
+MA_full_linear <- lmer(Acc ~ TargetCategory * Congruency * Bin + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), data = df.MA_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+
+
+## MODEL B: Arrow vs. Eyes vs. Face
+MB_full_linear <- lmer(Acc ~ TargetType * Congruency * Bin + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), data = df.MB_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+
+## MODEL C: Face Expression
+MC_full_linear <- lmer(Acc ~ Expression * Congruency * Bin + (1|Study:id), data = df.MC_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+```
+
+
+
+## Beta Regressions
+```{r beta regressions, echo = FALSE}
+# Adjusting values of the dependent variable. The dependent variable only can have values from 0 to 1, not including the boundaries.
+
+n <- nrow(df.MA_caf)
+
+df.MA_caf$AccAdj <- df.MA_caf$Acc
+df.MA_caf$AccAdj[df.MA_caf$Acc == 0] <- 1 / (2 * n)
+df.MA_caf$AccAdj[df.MA_caf$Acc == 1] <- (2 * n - 1) / (2*n)
+
+
+n <- nrow(df.MB_caf)
+
+df.MB_caf$AccAdj <- df.MB_caf$Acc
+df.MB_caf$AccAdj[df.MB_caf$Acc == 0] <- 1 / (2 * n)
+df.MB_caf$AccAdj[df.MB_caf$Acc == 1] <- (2 * n - 1) / (2*n)
+
+
+n <- nrow(df.MC_caf)
+
+df.MC_caf$AccAdj <- df.MC_caf$Acc
+df.MC_caf$AccAdj[df.MC_caf$Acc == 0] <- 1 / (2 * n)
+df.MC_caf$AccAdj[df.MC_caf$Acc == 1] <- (2 * n - 1) / (2 * n)
+
+
+
+#-----------------
+#BETA REGRESSION
+#-----------------
+
+## MODEL A: Global
+MA_full_beta <- glmmTMB(AccAdj ~ TargetCategory * Congruency * Bin + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), family = beta_family(), data = df.MA_caf) 
+
+
+## MODEL B: Global
+MB_full_beta <- glmmTMB(AccAdj ~ TargetType * Congruency * Bin + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), family = beta_family(), data = df.MB_caf) 
+
+
+
+## MODEL C: Face Expression
+MC_full_beta <- glmmTMB(AccAdj ~ Expression * Congruency * Bin + (1|Study:id), family = beta_family(), data = df.MC_caf) 
+
+
+#Save Models
+#save(MC_full_beta, file = "CAF_Analyses/models/beta/MC_full_beta.RData")
+```
+
+
+
+## Load Models
+```{r load models, echo = FALSE}
+modelType <- "linear" #Adjust to load the required model
+path_to_models <- paste0("CAF_Analyses/models/",modelType,"/")
+
+files <- list.files(path_to_models, full.names = TRUE)
+
+# Load each file
+for(file in files) {
+  load(file)
+}
+
+```
+
+
+
+## Cross-validation: MSE
+```{r cross-validation, echo = FALSE}
+seed <- 123098 #For reproducibility
+
+
+#Change the information according the model
+data <- df.MA_caf
+modelBeta <- MA_full_beta
+modelLinear <- MA_full_linear
+
+
+cross.validation(data, data.raw, modelBetaFit = modelBeta, modelLinearFit = modelLinear, k = 10, seed = seed)
+```
+
+
+
+
+# Prediction Plots
+```{r predictions and plots, echo = FALSE, fig.height = 3, fig.width = 4.6}
+# MA, MC, MD, MF h 3, w = 4.6
+# MB h 3, w 5.2
+# ME h 3, w 6.4
+
+
+#Change the information according the model
+data <- df.MA_caf
+linear_model <- MA_full_linear
+beta_model <- MA_full_beta
+factors <- c("TargetCategory", "Congruency", "Bin")
+
+
+
+plot_list <- prediction.plot(data, modelLinear = linear_model, modelBeta = beta_model, factors = factors)
+
+plot_list$Beta
+plot_list$Linear
+```
+

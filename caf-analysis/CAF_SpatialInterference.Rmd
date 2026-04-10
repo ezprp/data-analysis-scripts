@@ -1,0 +1,789 @@
+---
+title: "dA_SDspInt"
+output: html_document
+date: "2023-11-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rstatix)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ggeffects)
+emm_options(pbkrtest.limit = 100000)
+```
+
+
+
+
+# *Utility
+```{r utility functions, echo = FALSE}
+rm(list=ls())
+
+############################
+### BINNING FUNCTIONS ###
+
+
+#This function use quantile() R function to set the Bins limits, the default quantile estimator type is 7, see R documentation. Hyndman & Fan (1996) recommend type 8, whose estimations are median-unbiased regardless of the distribution of x.
+bin_caf <- function(rt_data, acc_data, n_quantiles = 5, typeQQ = 7) {
+  
+  quantiles <- quantile(rt_data, probs = seq(0, 1, length.out = n_quantiles + 1), type = typeQQ, na.rm = TRUE) #Equally sized bins estimated from the distribution -> if n_quantiles = 5, then 0.0 - 0.2 - 0.4 - 0.6 - 0.8 - 1.0 (20% Bins), although it don't equates the number of observations between Bins
+  
+  mean_rt <- sapply(1:n_quantiles, function(i) {
+    subset_rt <- if (i < n_quantiles) {
+      rt_data[rt_data >= quantiles[i] & rt_data < quantiles[i + 1]]
+    } else {
+      rt_data[rt_data >= quantiles[i] & rt_data <= quantiles[i + 1]] # Include the upper boundary for the last quantile
+    }
+    mean(subset_rt, na.rm = TRUE) # Averaging RT
+  })
+  
+  mean_acc <- sapply(1:n_quantiles, function(i) {
+    subset_acc <- if (i < n_quantiles) {
+      acc_data[rt_data >= quantiles[i] & rt_data < quantiles[i + 1]]
+    } else {
+      acc_data[rt_data >= quantiles[i] & rt_data <= quantiles[i + 1]] # Include the upper boundary for the last quantile
+    }
+    mean(subset_acc, na.rm = TRUE) # Averaging accuracy
+  })
+
+  return(list(mean_rt = mean_rt, mean_acc = mean_acc))
+}
+
+
+
+#Returns the CAF dataframe divided into n Bins (nBin) by id and by conditions entered as factors (e.g., c("TargetType", "Congruency")). It uses bin_caf()
+caf.dataframe <- function(data, factors, nBin = 5, typeQQ = 7){
+  
+  #Remove trials < 200 and > 1300
+  data <- data %>% filter(Trim == 0) %>% select(-Trim) %>% droplevels()
+  
+  bin_group <- function(data){
+    result <- bin_caf(data$RT, data$acc, nBin, typeQQ = typeQQ)
+    tibble::tibble(Bin = seq_len(nBin), meanBin = result$mean_rt, Acc = result$mean_acc)
+  }
+  
+  #Divide dataset into Bins 
+  caf <- data %>% group_by(id, across(all_of(factors))) %>% do(bin_group(.)) %>% ungroup() %>% convert_as_factor(Bin) %>% droplevels() %>% as.data.frame()
+  
+  return(caf)
+}
+
+
+
+# Effect Size using Variance of Random Effects(Westfall et al., 2014; Brysbaert & Stevens, 2018)
+westfall.effsize <- function(model, contrast){
+  #See the formula in Westfall et al. (2014)
+  
+  #Extracting the variance of random parameters
+  vr <- as.data.frame(VarCorr(model))
+  
+  
+  #getting the squared root of the pooled variance, taking into account the number of random parameters of the model
+  sum.vcov <- 0
+  
+  for(i in 1:nrow(vr)){
+    sum.vcov <- sum.vcov + vr$vcov[i]
+  }
+  
+  pooled_sd_vr <- sqrt(sum.vcov) 
+  
+  #Getting the estimates from the Tukey test
+  contrast <- summary(contrast)
+  df.contrast <- contrast[c(1,2,3, 4)]
+  
+  #Calculating d
+  out <- df.contrast %>% mutate(d = round((estimate/pooled_sd_vr), 3)) %>% select(-estimate)
+  
+  if("SE" %in% colnames(out) & "df" %in% colnames(out)){out <- out %>% select(-SE, -df)}
+  if("SE" %in% colnames(out)){out <- out %>% select(-SE)}
+  
+  return(out)
+}
+
+
+
+
+
+#############
+## PLOTS ###
+
+caf.plot_models <- function(data, interaction = NULL, factors = NULL, caption = NULL, ylim = c(0.80, 1.00), size.x = size.x, size.y = size.y){
+  
+  if(is.null(factors) || length(factors) < 1){stop("At least one factor should be specified.")}
+  
+  if(!all(factors %in% names(data))){stop("Not all specified factors are present in the data.")}
+  
+  #Converting estimated values into a dataframe
+  df_interaction <- summary(interaction)
+  
+  ###################
+  # Setting datasets
+  
+  if("Expression" %in% factors){
+    if("Expression" %in% colnames(df_interaction)){#MC: Expression * Congruency
+      
+      #Estimated values
+      caf_mean <- df_interaction %>% select(!!sym(factors[1]), Congruency, Acc = emmean, LCL = `lower.CL`, UCL = `upper.CL`)
+      
+      #Observed values: ids nested within Studies
+      observed_df <- data %>% group_by(Study, across(all_of(factors[1:2]))) %>% reframe(Acc = mean(Acc)) %>% group_by(across(all_of(factors[1:2]))) %>% reframe(Acc = mean(Acc)) %>% as.data.frame()
+      
+    } else {#MC: Congruency * Bin
+      
+      #Estimated values
+      emm_df <- df_interaction %>% select(!!sym(factors[2]), Bin, Acc = emmean, LCL = `lower.CL`, UCL = `upper.CL`)
+      
+      #Observed values: ids nested within Studies
+      observed_df <- data %>% group_by(Study, across(all_of(factors[2:3]))) %>% reframe(Acc = mean(Acc)) %>% group_by(across(all_of(factors[2:3]))) %>% reframe(Acc = mean(Acc)) %>% as.data.frame()
+      
+      #Setting x-axis according Bin
+      binsX_temp <- data %>% group_by(across(all_of(factors[2:3]))) %>% reframe(BinPercentage = case_when(Bin == 1 ~ "0-20", Bin == 2 ~ "20-40", Bin == 3 ~ "40-60", Bin == 4 ~ "60-80", Bin == 5 ~ "80-100", TRUE ~ "other")) %>% convert_as_factor(BinPercentage) %>% as.data.frame()
+      
+      #Adding x-axis for plotting
+      caf_mean <- left_join(emm_df, binsX_temp, by = c("Congruency", "Bin"))
+      
+      observed_df <- left_join(observed_df, binsX_temp, by = c("Congruency", "Bin"))
+      
+    }
+  } else {#Models MA & MB
+    
+    #Setting estimated values
+    emm_df <- df_interaction %>% select(!!sym(factors[1]), Congruency, Bin, Acc = emmean, LCL = `lower.CL`, UCL = `upper.CL`)
+    
+    #Setting observed values
+    observed_df <- data %>% group_by(Study, across(all_of(factors))) %>% reframe(Acc = mean(Acc)) %>% group_by(across(all_of(factors))) %>% reframe(Acc = mean(Acc)) %>% as.data.frame()
+    
+    #Setting x-axis according number of Bins
+    bin_levels <- levels(data$Bin)
+    
+    bin_percentage <- if(length(bin_levels) == 5){
+      c("0-20", "20-40", "40-60", "60-80", "80-100")
+    } else {
+      c("0-25", "25-50", "50-75", "75-100")
+    }
+    
+    binsX_temp <- data %>% group_by(across(all_of(factors))) %>% reframe(BinPercentage = case_when(Bin == 1 ~ bin_percentage[1], Bin == 2 ~ bin_percentage[2], Bin == 3 ~ bin_percentage[3], Bin == 4 ~ bin_percentage[4], Bin == 5 ~ bin_percentage[5], TRUE ~ "other")) %>% convert_as_factor(BinPercentage) %>% as.data.frame()
+    
+    caf_mean <- left_join(emm_df, binsX_temp, by = factors)
+    
+    observed_df <- left_join(observed_df, binsX_temp, by = factors)
+    
+  }
+  
+  y.label <- "EM Acc"
+  
+  
+  ###################
+  # Plotting
+  
+  plot <- if(!"TargetType" %in% colnames(caf_mean) & !"TargetCategory" %in% colnames(caf_mean)){
+    
+    if("Expression" %in% colnames(caf_mean)){#Model MC: Expression * Congruency
+      
+      ggplot(caf_mean, aes(x = Expression, y = Acc, color = Congruency, fill = Congruency)) + geom_bar(stat = "identity", position = position_dodge(), width = .7, alpha = .9) + geom_errorbar(aes(ymin = LCL, ymax = UCL), width = .25, position = position_dodge(width = .7), color = "black") + geom_point(data = observed_df, aes(x = Expression, y = Acc, shape = "Observed"), size = 3, color= "black", position = position_dodge(width = .7), show.legend = F) + scale_color_manual(values = c("darkblue", "darkred")) + scale_fill_manual(values = c("darkblue", "darkred")) + scale_shape_manual(name = "DataType", values = c("Observed" = 4)) + labs(x = "", y = y.label, caption = caption) + coord_cartesian(ylim = ylim) + theme_bw(base_size = 11) + theme(legend.position = "top")
+      
+    } else {#Model MC: Congruency * Bin
+      
+      ggplot(caf_mean, aes(x = BinPercentage, y = Acc, color = Congruency)) + geom_errorbar(aes(ymin = LCL, ymax = UCL), width = .2) + geom_line(aes(group = Congruency, linetype = "Estimated"), linewidth = .5, show.legend = F) + geom_point(aes(fill = Congruency, shape = "Estimated"), size = 3, stroke = 1, color = "black") + geom_point(data = observed_df, aes(x = BinPercentage, y = Acc, color = Congruency, shape = "Observed"), size = 4) + scale_color_manual(values = c("darkblue", "darkred")) + scale_fill_manual(values = c("darkblue", "darkred")) + scale_shape_manual(name = "DataType", values = c("Estimated" = 21, "Observed" = 4)) + labs(x = "RT Bin(%)", y = y.label, caption = caption) + theme_bw(base_size = 11) + theme(legend.position = "right", plot.caption = element_text(size = 11, hjust = 0, face = "italic")) + ylim(ylim)
+    }
+    
+  } else {# Model MA & MB
+    
+    facet_var <- factors[!factors %in% c("Congruency", "Bin")][1]
+    
+    ggplot(caf_mean, aes(x = BinPercentage, y = Acc, color = Congruency)) + geom_errorbar(aes(ymin = LCL, ymax = UCL), width = .2) + geom_line(aes(group = Congruency, linetype = "Estimated"), linewidth = .5, show.legend = F) + geom_point(aes(fill = Congruency, shape = "Estimated"), size = 3, stroke = 1, color = "black") + geom_point(data = observed_df, aes(x = BinPercentage, y = Acc, color = Congruency, shape = "Observed"), size = 4) + facet_grid(~get(facet_var)) + scale_color_manual(values = c("darkblue", "darkred")) + scale_fill_manual(values = c("darkblue", "darkred")) + scale_shape_manual(name = "DataType", values = c("Estimated" = 21, "Observed" = 4)) + labs(x = "RT Bin(%)", y = y.label, caption = caption) + theme_bw(base_size = 11) + theme(legend.position = "right", plot.caption = element_text(size = 11, hjust = 0, face = "italic"), axis.text.x = element_text(size = size.x), axis.text.y = element_text(size = size.y)) + ylim(ylim)
+    
+  }
+  
+  return(plot)
+}
+
+
+
+#Interaction plot
+caf.plot_interaction <- function(interaction, caption = NULL, ylim = c(0.80, 1.01)){
+  
+  interaction_df <- as.data.frame(interaction) %>% filter(Bin !=3, Bin != 4, Bin != 5) %>% mutate(Bin = ifelse(Bin == 1, "Bin 1", "Bin 2"))
+  
+  if("TargetCategory" %in% colnames(interaction_df)){color_var <- sym("TargetCategory")
+  colors <- c('#1E88E5', '#E67E22')} else if("TargetType" %in% colnames(interaction_df)){color_var <- sym("TargetType")
+  colors <- c('#1E88E5', "#004D40", '#E67E22')} else{stop("No column name.")}
+  
+  
+  
+  ggplot(interaction_df, aes(x = Congruency, y = emmean, color = !!color_var, group = !!color_var)) + geom_line() + geom_point(aes(fill = !!color_var), size = 3, stroke = 1, shape = 21, color = "black") + geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.1) + facet_wrap(~ Bin, ncol = 3) + scale_color_manual(values = colors) + scale_fill_manual(values = colors) + labs(y = "EMM Acc", x = "", caption = caption, color = "Target type", fill = "Target type") + theme_bw(base_size = 12) + theme(legend.position = "right", plot.caption = element_text(size = 12, hjust = 0, face = "italic")) + ylim(ylim)
+}
+```
+
+
+
+# Load Dataset
+```{r load datasets, echo = FALSE}
+#Load Datasets divided by Bins 
+
+## 5 Bins datasets
+df.MA_caf <- read.csv("../datasets_caf/MA_5bins.csv", header = T, sep = ";", dec = ",") %>% rename(TargetCategory = TargetType) %>% convert_as_factor(id, TargetCategory, Congruency, Study, Bin) %>% reorder_levels(TargetCategory, order = c("Social", "NonSocial")) %>% as.data.frame()
+
+df.MB_caf <- read.csv("../datasets_caf/MB_5bins.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, Bin) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows")) %>% as.data.frame()
+
+df.MC_caf <- read.csv("../datasets_caf/MC_5bins.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, Expression, Congruency, Study, Bin) %>% as.data.frame()
+
+
+## 4 Bins datasets
+df.MA_caf.4B <- read.csv("../datasets_caf/MA_4bins.csv", header = T, sep = ";", dec = ",") %>% rename(TargetCategory = TargetType) %>%  convert_as_factor(id, TargetCategory, Congruency, Study, Bin) %>% reorder_levels(TargetCategory, order = c("Social", "NonSocial")) %>% as.data.frame() 
+
+df.MB_caf.4B <- read.csv("../datasets_caf/MB_4bins.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, Bin) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows")) %>% as.data.frame()
+
+
+#Load dataset for target type block design for comparison
+df.designTT_caf <- read.csv("../datasets/designTT_df.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, Bin, BlockDesign) %>% as.data.frame()
+
+
+## NO TRIMMED Datasets
+df.MA_caf_NoTrim <- read.csv("../datasets_caf/MA_5bins_NoTrim.csv", header = T, sep = ";", dec = ",") %>% rename(TargetCategory = TargetType) %>% convert_as_factor(id, TargetCategory, Congruency, Study, Bin) %>% reorder_levels(TargetCategory, order = c("Social", "NonSocial")) %>% as.data.frame()
+
+df.MB_caf_NoTrim <- read.csv("../datasets_caf/MB_5bins_NoTrim.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, Bin) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows")) %>% as.data.frame()
+
+df.MC_caf_NoTrim <- read.csv("../datasets_caf/MC_5bins_NoTrim.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, Expression, Congruency, Study, Bin) %>% as.data.frame()
+```
+
+
+# ...................
+# MODELLING
+
+# Linear Mixed-Models 
+```{r linear models, echo = FALSE}
+#-------------------
+#LINEAR MIXED REGRESSION
+#------------------
+
+## MODEL A: Global
+MA_full_linear <- lmer(Acc ~ TargetCategory * Congruency * Bin + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), data = df.MA_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MA_full_linear.4B <- lmer(Acc ~ TargetCategory * Congruency * Bin + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), data = df.MA_caf.4B, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MA_level1_linear <- lmer(Acc ~ TargetCategory * Congruency + Congruency * Bin + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), data = df.MA_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MA_level2_linear <- lmer(Acc ~ TargetCategory * Congruency + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), data = df.MA_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MA_null_linear <- lmer(Acc ~ 1 + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), data = df.MA_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+anova(MA_full_linear, MA_level1_linear, MA_level2_linear, MA_null_linear)
+
+
+
+## MODEL B: Arrow vs. Eyes vs. Face
+MB_full_linear <- lmer(Acc ~ TargetType * Congruency * Bin + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), data = df.MB_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MB_full_linear.4B <- lmer(Acc ~ TargetType * Congruency * Bin + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), data = df.MB_caf.4B, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MB_level1_linear <- lmer(Acc ~ TargetType * Congruency + Congruency * Bin + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), data = df.MB_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MB_level2_linear <- lmer(Acc ~ TargetType * Congruency + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), data = df.MB_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MB_null_linear <- lmer(Acc ~ 1 + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), data = df.MB_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+anova(MB_full_linear, MB_level1_linear, MB_level2_linear, MB_null_linear)
+
+
+
+## MODEL C: Face Expression
+MC_full_linear <- lmer(Acc ~ Expression * Congruency * Bin + (1|Study:id), data = df.MC_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MC_level1_linear <- lmer(Acc ~ Expression * Congruency + Congruency * Bin + (1|Study:id), data = df.MC_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MC_level2_linear <- lmer(Acc ~ Expression * Congruency + (1|Study:id), data = df.MC_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MC_null_linear <- lmer(Acc ~ 1 + (1|Study:id), data = df.MC_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+
+anova(MC_full_linear, MC_level1_linear, MC_level2_linear, MC_null_linear)
+
+
+#Save Models
+#save(MB_full_linearNTile, file = "CAF_Analyses/models/linear/MB_full_linearNTile.RData")
+```
+
+
+
+## Target type block design comparissons
+```{r target type block, echo = FALSE}
+#Comparison between-block vs within-block studies
+
+
+MDesign_saturated_linear <- lmer(Acc ~ TargetType * Congruency * Bin + BlockDesign + (1|id:Study), data = df.designTT_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+
+MDesign_full_linear <- lmer(Acc ~ TargetType * Congruency * Bin + (1|id:Study), data = df.designTT_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+MDesign_null_linear <- lmer(Acc ~ 1 + (1|id:Study), data = df.designTT_caf, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+anova(MDesign_saturated_linear, MDesign_full_linear, MDesign_null_linear)
+```
+
+
+
+## Load Models & Contrasts
+```{r load models, echo = FALSE}
+#Load Models
+path_to_models <- paste0("../models/linear")
+
+files <- list.files(path_to_models, full.names = TRUE)
+
+for(file in files) {
+  load(file)
+}
+
+
+#Load contrasts
+path_to_contrasts <- "../emm_acc"
+
+files <- list.files(path_to_contrasts, full.names = T)
+
+for(file in files){
+  load(file)
+}
+```
+ 
+ 
+ 
+
+## ANOVAs
+```{r anovas, echo = FALSE}
+#Model A:
+anova(MA_full_linear, MA_level1_linear)
+anova(MA_full_linear)
+anova(MA_full_linear.4B)
+ranova(MA_full_linear)
+
+
+# Model B:
+anova(MB_full_linear, MB_level1_linear)
+anova(MB_full_linear)
+anova(MB_full_linear.4B)
+performance::model_performance(MB_full_linear)
+
+
+#Model C:
+anova(MC_level1_linear, MC_level2_linear)
+anova(MC_level1_linear)
+ranova(MC_level1_linear)
+
+
+#save(MC_level1_linear, file = "CAF_Analyses/models/linear/MC_level1_linear.RData")
+```
+
+
+
+## Partial Eta Squared
+```{r partial eta squared, echo = FALSE}
+#Estimation of the eta partial squared using effectsize package (Ben-Shachar et al. 2020)
+eta_sq <- function(model){
+  anova_mod <- anova(model)
+  rows <- row.names(anova_mod)
+  
+  out <- data.frame(Effect = character(0), EtaP2 = numeric(0), CI_low = numeric(0), CI_high = numeric(0))
+  
+  for(i in 1:length(rows)){
+    eta.p2 <- effectsize::F_to_eta2(anova_mod$`F value`[i], anova_mod$NumDF[i], anova_mod$DenDF[i])
+    
+    out <- rbind(out, data.frame(Effect = rows[i], EtaP2 = round(eta.p2$Eta2_partial,3), CI_low = round(eta.p2$CI_low,3), CI_high = round(eta.p2$CI_high, 3)))
+    
+  }
+  
+  return(out)
+}
+
+
+eta_sq(MC_level1_linear)
+```
+
+
+
+
+
+
+# ...................
+# CONTRASTS: emmeans package (Lenth, 2023)
+
+# Three-way contrasts
+## Contrast A: ~Congruency|TargetType * Bin
+```{r linear contrast model A, echo = FALSE}
+#MODEL MA
+MA_emm_interactionA.3w <- emmeans(MA_full_linear, ~Congruency|TargetCategory * Bin, type = "response")
+
+MA_contrastA.3w <- contrast(MA_emm_interactionA.3w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#MODEL MB
+MB_emm_interactionA.3w <- emmeans(MB_full_linear, specs = ~Congruency|TargetType * Bin, type = "response")
+
+MB_contrastA.3w <- contrast(MB_emm_interactionA.3w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#Save contrasts
+#save(MB_emm_interactionA.3w.ntile, file = "CAF_Analyses/emm_acc/MB_emm_interactionA_3w.ntile.RData")
+```
+
+
+
+## Contrast B: ~Bin|TargetType * Congruency
+```{r linear contrast B, echo = FALSE}
+#MODEL MA
+MA_emm_interactionB.3w <- emmeans(MA_full_linear, ~Bin|TargetCategory * Congruency, type = "response")
+
+MA_contrastB.3w <- contrast(MA_emm_interactionB.3w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#MODEL MB
+MB_emm_interactionB.3w <- emmeans(MB_full_linear, ~Bin|TargetType * Congruency, type = "response")
+
+MB_contrastB.3w <- contrast(MB_emm_interactionB.3w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#Saving estimates, change the name accordingly
+#save(MB_emm_interactionB.3w.ntile, file = "CAF_Analyses/emm_acc/MB_emm_interactionB_3w.ntile.RData")
+```
+
+
+
+## Contrasts 4 BINS Models
+```{r 4 bins models contrasts, echo = FALSE}
+MA_contrastA.3w.4B <- contrast(MA_emm_interactionA.3w.4B, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+MB_contrastA.3w.4B <- contrast(MB_emm_interactionA.3w.4B, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+MA_contrastB.3w.4B <- contrast(MA_emm_interactionB.3w.4B, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+MB_contrastB.3w.4B <- contrast(MB_emm_interactionB.3w.4B, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+```
+
+
+
+
+# Two-way contrasts
+
+## Contrast A: ~TargetType|Congruency
+```{r contrast A 2w, echo = FALSE}
+#Model A
+MA_emm_interactionA.2w <- emmeans(MA_full_linear, ~TargetCategory|Congruency, type = "response")
+
+
+MA_contrastA.2w <- contrast(MA_emm_interactionA.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#Model B
+MB_emm_interactionA.2w <- emmeans(MB_full_linear, ~TargetType|Congruency, type = "response")
+
+MB_contrastA.2w <- contrast(MB_emm_interactionA.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#Model C
+MC_emm_interactionA1.2w <- emmeans(MC_level1_linear, ~Expression|Congruency, type = "response")
+
+MC_contrastA1.2w <- contrast(MC_emm_interactionA1.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+MC_emm_interactionA2.2w <- emmeans(MC_level1_linear, ~Congruency|Expression, type = "response")
+
+MC_contrastA2.2w <- contrast(MC_emm_interactionA2.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#Save contrasts
+save(MC_emm_interactionA2.2w, file = "CAF_Analyses/emm_acc/MC_emm_interactionA2_2w.RData")
+```
+
+
+
+## Contrast B: ~TargetType|Bin
+```{r contrast B 2w, echo = FALSE}
+#Model A
+MA_emm_interactionB.2w <- emmeans(MA_full_linear, ~TargetCategory|Bin, type = "response")
+
+
+MA_contrastB.2w <- contrast(MA_emm_interactionB.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#Model B
+MB_emm_interactionB.2w <- emmeans(MB_full_linear, ~TargetType|Bin, type = "response") 
+
+MB_contrastB.2w <- contrast(MB_emm_interactionB.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+# Save contrasts
+#save(MB_emm_interactionB.2w, file = "CAF_Analyses/emm_acc/MB_emm_interactionB_2w.RData")
+```
+
+
+## Contrast C: ~Congruency|Bin & ~Bin|Congruency
+```{r contrast C 2w, echo = FALSE}
+# Model A
+MA_emm_interactionC.2w <- emmeans(MA_full_linear, ~Congruency|Bin, type = "response")
+
+MA_contrastC.2w <- contrast(MA_emm_interactionC.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#Model B
+MB_emm_interactionC.2w <- emmeans(MB_full_linear, ~Congruency|Bin, type = "response")
+
+MB_contrastC.2w <- contrast(MB_emm_interactionC.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#Model C
+MC_emm_interactionC1.2w <- emmeans(MC_level1_linear, ~Congruency|Bin, type = "response")
+
+MC_contrastC1.2w <- contrast(MC_emm_interactionC1.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+MC_emm_interactionC2.2w <- emmeans(MC_level1_linear, ~Bin|Congruency, type = "response")
+
+MC_contrastC2.2w <- contrast(MC_emm_interactionC2.2w, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#Save contrasts
+#save(MC_emm_interactionC2.2w, file = "CAF_Analyses/emm_acc/MC_emm_interactionC2_2w.RData")
+```
+
+
+
+# Main Effects:
+```{r contrasts of Main effects, echo = FALSE}
+############
+#MODEL MA:
+
+## TargetType
+MA_emm_TT <- emmeans(MA_full_linear, specs = ~TargetCategory, type = "response")
+
+MA_contrast_TT <- contrast(MA_emm_TT, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+
+## Bin
+MA_emm_Bin <- emmeans(MA_full_linear, specs = ~Bin, type = "response")
+
+MA_contrast_Bin <- contrast(MA_emm_Bin, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+## Congruency
+MA_emm_Cong <- emmeans(MA_full_linear, specs = ~Congruency, type = "response")
+
+
+
+
+##############
+# MODEL MB
+MB_contrast_TT <- contrast(MB_emm_TT, method = "tukey", adjust = "tukey")
+
+
+## Bin
+MB_emm_Bin <- emmeans(MB_full_linear, specs = ~Bin, type = "response")
+
+MB_contrast_Bin <- contrast(MB_emm_Bin, method = "tukey", adjust = "tukey")
+
+
+
+##############
+#MODEL MC
+
+## Expression
+MC_emm_Exp <- emmeans(MC_level1_linear, specs = ~Expression, type = "response")
+
+MC_contrast_Exp <- contrast(MC_emm_Exp, method = "tukey", adjust = "tukey")
+
+
+## Cong
+MC_emm_Cong <- emmeans(MC_level1_linear, specs = ~Congruency, type = "response")
+
+MC_contrast_Cong <- contrast(MC_emm_Cong, method = "tukey", adjust = "tukey")
+
+
+## Bin
+MC_emm_Bin <- emmeans(MC_level1_linear, specs = ~Bin, type = "response")
+
+MC_contrast_Bin <- contrast(MC_emm_Bin, method = "tukey", adjust = "tukey")
+
+
+#Save interactions
+save(MC_emm_Exp, file = "CAF_Analyses/emm_acc/MC_emm_Exp.RData")
+```
+
+
+
+# Effect Size using Variance of Random Effects
+```{r westfall effect size, echo = FALSE}
+westfall.effsize(MB_full_linear.4B, MB_contrastA.3w.4B)
+```
+
+
+
+
+# ...................
+# PLOTS
+## Plot Models: CAF
+```{r caf plot, echo = FALSE, fig.height = 3.4, fig.width = 7.2}
+#MA: h 3.4, w 6.2
+#MB: h 3.4, w 7.8
+#MCA: h 3.5, w 4
+#MCB: h 3.5, w 3.8
+
+
+###########
+### 5 BINS
+caf.plot_models(df.MA_caf, interaction = MA_emm_interactionA.3w, factors = c("TargetCategory", "Congruency", "Bin"), caption = "MA", ylim = c(0.80, 1.01), size.x = 9.4, size.y = 10)
+
+caf.plot_models(df.MB_caf, interaction = MB_emm_interactionA.3w, factors = c("TargetType", "Congruency", "Bin"), caption = "MB", ylim = c(0.80, 1.01), size.x = 8.4, size.y = 10)
+
+
+caf.plot_models(df.MC_caf, interaction = MC_emm_interactionA1.2w, factors = c("Expression", "Congruency", "Bin"), caption = "Expression")
+
+caf.plot_models(df.MC_caf, interaction = MC_emm_interactionC1.2w, factors = c("Expression", "Congruency", "Bin"), caption = "Expression")
+
+
+
+###########
+### 4 BINS
+caf.plot_models(df.MA_caf.4B, interaction = MA_emm_interactionA.3w.4B, factors = c("TargetCategory", "Congruency", "Bin"), caption = "MA", ylim = c(0.80, 1.01), size.x = 9.4, size.y = 10)
+
+caf.plot_models(df.MB_caf.4B, interaction = MB_emm_interactionB.3w.4B, factors = c("TargetType", "Congruency", "Bin"), caption = "Face vs. Eyes vs. Arrows", ylim = c(0.80, 1.01), size.x = 9.4, size.y = 10)
+```
+
+
+## Plot: Interactions
+```{r plot interactions, echo = FALSE, fig.height = 3, fig.width = 5.4}
+# Bins: h 3, w 5.4
+#Plot the Interactions 
+
+
+caf.plot_interaction(MA_emm_interactionA.3w, "MA - 5 Bins")
+caf.plot_interaction(MA_emm_interactionA.3w.4B, "MA - 4 Bins")
+
+caf.plot_interaction(MB_emm_interactionA.3w, "MB - 5 Bins")
+caf.plot_interaction(MB_emm_interactionA.3w.4B, "MB - 4 Bins")
+```
+
+
+# ...................
+# NO TRIMMED Analyses
+## Linear Mixed-Models 
+```{r linear models, echo = FALSE}
+#-------------------
+#LINEAR MIXED REGRESSION
+#------------------
+
+## MODEL A: Global
+MA_full_linear_NoTrim <- lmer(Acc ~ TargetCategory * Congruency * Bin + (1|Study:id) + (1|Study:TargetCategory) + (1|Study:TargetCategory:Congruency:Bin), data = df.MA_caf_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+
+## MODEL B: Arrow vs. Eyes vs. Face
+MB_full_linear_NoTrim <- lmer(Acc ~ TargetType * Congruency * Bin + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:Bin), data = df.MB_caf_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+
+
+## MODEL C: Face Expression
+MC_level1_linear_NoTrim <- lmer(Acc ~ Expression * Congruency + Congruency * Bin + (1|Study:id), data = df.MC_caf_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1000000)))
+```
+
+
+## MA & MB Contrasts 
+```{r linear contrast model A, echo = FALSE}
+####################################
+## A: ~Congruency|TargetType * Bin
+
+#MODEL MA
+MA_emm_interactionA.3w_NoTrim <- emmeans(MA_full_linear_NoTrim, ~Congruency|TargetCategory * Bin, type = "response")
+
+MA_contrastA.3w_NoTrim <- contrast(MA_emm_interactionA.3w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#MODEL MB
+MB_emm_interactionA.3w_NoTrim <- emmeans(MB_full_linear_NoTrim, specs = ~Congruency|TargetType * Bin, type = "response")
+
+MB_contrastA.3w_NoTrim <- contrast(MB_emm_interactionA.3w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+
+####################################
+## B: ~Bin|TargetType * Congruency
+
+#MODEL MA
+MA_emm_interactionB.3w_NoTrim <- emmeans(MA_full_linear_NoTrim, ~Bin|TargetCategory * Congruency, type = "response")
+
+MA_contrastB.3w_NoTrim <- contrast(MA_emm_interactionB.3w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#MODEL MB
+MB_emm_interactionB.3w_NoTrim <- emmeans(MB_full_linear_NoTrim, ~Bin|TargetType * Congruency, type = "response")
+
+MB_contrastB.3w_NoTrim <- contrast(MB_emm_interactionB.3w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+
+#Save contrasts
+#save(MB_emm_interactionB.3w_NoTrim, file = "../emm_acc/MB_emm_interactionB_3w_NoTrim.RData")
+```
+
+
+
+## MC Contrasts A: ~TargetType|Congruency
+```{r contrast A 2w, echo = FALSE}
+#Interaction A1
+MC_emm_interactionA1.2w_NoTrim <- emmeans(MC_level1_linear_NoTrim, ~Expression|Congruency, type = "response")
+
+MC_contrastA1.2w_NoTrim <- contrast(MC_emm_interactionA1.2w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#Interaction A2
+MC_emm_interactionA2.2w_NoTrim <- emmeans(MC_level1_linear_NoTrim, ~Congruency|Expression, type = "response")
+
+MC_contrastA2.2w_NoTrim <- contrast(MC_emm_interactionA2.2w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#Interaction C1
+MC_emm_interactionC1.2w_NoTrim <- emmeans(MC_level1_linear_NoTrim, ~Congruency|Bin, type = "response")
+
+MC_contrastC1.2w_NoTrim <- contrast(MC_emm_interactionC1.2w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+MC_emm_interactionC2.2w_NoTrim <- emmeans(MC_level1_linear_NoTrim, ~Bin|Congruency, type = "response")
+
+MC_contrastC2.2w_NoTrim <- contrast(MC_emm_interactionC2.2w_NoTrim, method = "tukey", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+#Save contrasts
+#save(MC_emm_interactionC2.2w_NoTrim, file = "../emm_acc/MC_emm_interactionC2_2w_NoTrim.RData")
+```
+
+
+
+## Plot CAFs
+```{r caf plot, echo = FALSE, fig.height = 3.4, fig.width = 7.2}
+
+###########
+### 5 BINS
+caf.plot_models(df.MA_caf_NoTrim, interaction = MA_emm_interactionA.3w_NoTrim, factors = c("TargetCategory", "Congruency", "Bin"), caption = "MA_NoTrim", ylim = c(0.80, 1.01), size.x = 9.4, size.y = 10)
+
+caf.plot_models(df.MB_caf_NoTrim, interaction = MB_emm_interactionA.3w_NoTrim, factors = c("TargetType", "Congruency", "Bin"), caption = "MB_NoTrim", ylim = c(0.80, 1.01), size.x = 8.4, size.y = 10)
+
+
+caf.plot_models(df.MC_caf_NoTrim, interaction = MC_emm_interactionA1.2w, factors = c("Expression", "Congruency", "Bin"), caption = "Expression_NoTrim")
+
+caf.plot_models(df.MC_caf_NoTrim, interaction = MC_emm_interactionC1.2w, factors = c("Expression", "Congruency", "Bin"), caption = "Expression_NoTrim")
+```
+
