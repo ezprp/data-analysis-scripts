@@ -1,0 +1,731 @@
+---
+title: "dA_SDspInt"
+author: "Renato Ponce"
+output: html_document
+date: "2024-06-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rstatix)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+emm_options(pbkrtest.limit = 10000000)
+```
+
+
+# *Utility
+```{r utility function, echo = FALSE}
+rm(list=ls()) #Cleaning workspace
+
+#Functions employed throughout the analyses
+
+#############################################################
+#Quantile estimation function: divide dataset into q quantiles
+
+#Parameters employed in analysis: type = 8, method = "qq"
+# If method = "qq", quantiles are estimated with quantile function, it uses type 8 by default, Hyndmann & Fan (1996) recommend type 8, see R documentation.
+# If method = "hd", it uses Harrel-Davis estimator (Harrel & Davis, 1982) via package "Hmisc"
+quantile_dataframe <- function(data, factors = NULL, n_quantiles = 5, qq_probs = c(.1, .3, .5, .7, .9), typeQQ = 8, method = "qq", trim = TRUE){
+  
+  #If trim == true, selecting correct responses and Trimming: 200 < RT < 1300
+  if(trim){data <- data %>% filter(Trim == 0, acc == 1) %>% select(-Trim) %>% droplevels()
+  } else {data <- data %>% filter(RT != 0, acc == 1) %>% select(-Trim) %>% droplevels()}
+  
+  
+  
+  #Estimating quantiles at probailities qq_probs by subject and conditions. If hd_estim = TRUE, it uses the Harrell-Davis (1982) estimator.
+  if(method == "qq"){
+    
+    qq <- data %>% group_by(id, across(all_of(factors))) %>% reframe(RT = quantile(RT, probs = qq_probs, type = typeQQ))
+    
+  } else if(method == "hd") {
+    
+    #Install Hmisc package if necessary
+    if(!require("Hmisc")) install.packages("Hmisc")
+    
+    qq <- data %>% group_by(id, across(all_of(factors))) %>% reframe(RT = Hmisc::hdquantile(RT, probs = qq_probs))
+    
+  } else if(method == "bin"){
+    
+    #Equally sized quantiles and then averaging
+    out <- data %>% group_by(id, across(all_of(factors))) %>% mutate(QQ = cut(RT, breaks = quantile(RT, probs = seq(0, 1, length.out = n_quantiles + 1), names = FALSE), include.lowest = TRUE, labels = FALSE)) %>% mutate(QQ = paste0("q", QQ)) %>% convert_as_factor(QQ) %>% group_by(id, across(all_of(factors)), QQ) %>% reframe(RT = mean(RT)) %>% as.data.frame()
+    
+  }
+  
+  if(method != "bin"){
+    
+    out <- qq %>% group_by(id, across(all_of(factors))) %>% mutate(QQ = factor(rep(paste0("q", 1:n_quantiles), each = n()/n_quantiles), levels = paste0("q", 1:n_quantiles))) %>% as.data.frame()
+  
+    attributes(out$RT) <- NULL #Removing extra attributes
+  }
+  
+  return(out)
+}
+
+
+
+#Works with quantile_dataframe(), therefore it use correct and trimmed (if true) responses.
+delta_dataframe <- function(data, factors, n_quantiles = 5, typeQQ = 8, qq_probs = c(.1, .3, .5, .7, .9), method = "qq", trim = TRUE){
+  
+  #Getting delta values using quantile_dataframe()
+  delta <- data %>% quantile_dataframe(factors = factors, n_quantiles = n_quantiles, qq_probs =  qq_probs, typeQQ = typeQQ, method = method, trim = trim) %>% pivot_wider(names_from = "Congruency", values_from = "RT") %>% mutate(delta = incongruent - congruent, meanRT = (congruent + incongruent)/2) %>% droplevels() %>% as.data.frame()
+  
+  return(delta)
+}
+
+
+#Function Handle: Estimation of the eta partial squared using effectsize package
+eta_sq <- function(model){
+  anova_mod <- anova(model)
+  rows <- row.names(anova_mod)
+  
+  out <- data.frame(Effect = character(0), EtaP2 = numeric(0), CI_low = numeric(0), CI_high = numeric(0))
+  
+  for(i in 1:length(rows)){
+    #Install effectsize package if necessary
+    if(!require("effectsize")) install.packages("effectsize")
+    eta.p2 <- effectsize::F_to_eta2(anova_mod$`F value`[i], anova_mod$NumDF[i], anova_mod$DenDF[i])
+    
+    out <- rbind(out, data.frame(Effect = rows[i], EtaP2 = round(eta.p2$Eta2_partial,3), CI_low = round(eta.p2$CI_low,3), CI_high = round(eta.p2$CI_high, 3)))
+    
+  }
+  
+  return(out)
+}
+
+
+
+# Effect Size using Variance of Random Effects(Westfall et al., 2014; Brysbaert & Stevens, 2018)
+westfall.effsize <- function(model, contrast){
+  #See the formula in Westfall et al. (2014)
+  
+  #Extracting the variance of random parameters
+  vr <- as.data.frame(VarCorr(model))
+  
+  
+  #getting the squared root of the pooled variance, taking into account the number of random parameters of the model
+  sum.vcov <- 0
+  
+  for(i in 1:nrow(vr)){
+    sum.vcov <- sum.vcov + vr$vcov[i]
+  }
+  
+  pooled_sd_vr <- sqrt(sum.vcov) 
+  
+  #Getting the estimates from the Tukey test
+  contrast <- summary(contrast)
+  df.contrast <- contrast[c(1,2,3, 4)]
+  
+  if("emmean" %in% colnames(df.contrast)){df.contrast <- df.contrast %>% rename(estimate = emmean)} #Changing column name in case of the one-sample test
+  
+  #Calculating d
+  out <- df.contrast %>% mutate(d = round((estimate/pooled_sd_vr), 3)) %>% select(-estimate)
+  
+  if("SE" %in% colnames(out) & "df" %in% colnames(out)){out <- out %>% select(-SE, -df)}
+  if("SE" %in% colnames(out)){out <- out %>% select(-SE)}
+  
+  return(out)
+}
+
+
+
+
+#######################
+####### PLOTS #########
+qq_plot <- function(data, interaction = NULL, factors = NULL, size_x = 11, size_y = 11, x_lab = "Quantiles"){
+  
+  
+  #####################
+  ## Estimated values
+  #Converting the interaction values into data frame
+  df_interaction <- summary(interaction)
+  
+  emm_qq_df <- df_interaction %>% select(!!sym(factors[1]), !!sym(factors[2]), RT = emmean, LCL = `lower.CL`, UCL = `upper.CL`) %>% arrange(!!sym(factors[1]), !!sym(factors[2]))
+  
+  
+  #####################
+  ## Observed values
+  #ids nested within Studies
+  observed_df <- data %>% group_by(Study, across(all_of(factors))) %>% reframe(RT = mean(RT)) %>% group_by(across(all_of(factors))) %>% reframe(RT = mean(RT)) %>% as.data.frame()
+  
+  
+  #####################
+  # Plotting
+  plot <- if("TargetType" %in% factors & "QQ" %in% factors){#M_qq: TargetType * QQ
+    
+    ggplot(emm_qq_df, aes(x = QQ, y = RT, color = TargetType)) + geom_point(aes(fill = TargetType, shape = "Estimated"), size = 3, stroke = 1, color = "black") + geom_errorbar(aes(ymin = LCL, ymax = UCL), width = .2) + geom_line(aes(group = TargetType), linewidth = .5) + geom_point(data = observed_df, aes(x = QQ, y = RT, color = TargetType, shape = "Observed"), size = 4) + scale_color_manual(values = c("#014A94", "#DC6E06", "#004D40")) + scale_fill_manual(values = c("#014A94", "#DC6E06", "#004D40")) + scale_shape_manual(name = "DataType", values = c("Estimated" = 21, "Observed" = 4)) + labs(x = x_lab, y = "EMM-RT (ms)") + theme_grey(base_size = 12) + theme(axis.text.x = element_text(size = size_x), axis.text.y = element_text(size = size_y))
+    
+  } else if("TargetType" %in% factors & "Congruency" %in% factors){ #M_qq: TargetType * Congruency
+    
+    ggplot(emm_qq_df, aes(x = TargetType, y = RT, color = Congruency, fill = Congruency)) + geom_bar(stat = "identity", position = position_dodge(), width = .7, alpha = .9) + geom_errorbar(aes(ymin = LCL, ymax = UCL), width = .20, position = position_dodge(width = .7), color = "black") + geom_point(data = observed_df, aes(x = TargetType, y = RT, shape = "Observed"), size = 3, color = "black", position = position_dodge(width = .7), show.legend = F) + scale_color_manual(values = c("darkblue", "darkred")) + scale_fill_manual(values = c("darkblue", "darkred")) + scale_shape_manual(name = "DataType", values = c("Observed" = 4)) + coord_cartesian(ylim = c(460, 660)) + labs(x = "", y = "EMM-RT (ms)") + theme_grey(base_size = 12) + theme(axis.text.x = element_text(size = size_x), axis.text.y = element_text(size = size_y))
+    
+  } else if("Congruency" %in% factors & "QQ" %in% factors){ #M_qq: Congruency * QQ
+    
+    ggplot(emm_qq_df, aes(x = QQ, y = RT, color = Congruency, fill = Congruency)) + geom_point(aes(fill = Congruency, shape = "Estimated"), size = 3, stroke = 1, color = "black") + geom_errorbar(aes(ymin = LCL, ymax = UCL), width = .2) + geom_line(aes(group = Congruency), linewidth = .5) + geom_point(data = observed_df, aes(x = QQ, y = RT, color = Congruency, shape = "Observed"), size = 4) + scale_color_manual(values = c("darkblue", "darkred")) + scale_fill_manual(values = c("darkblue", "darkred")) + scale_shape_manual(name = "DataType", values = c("Estimated" = 21, "Observed" = 4)) + labs(x = x_lab, y = "EMM-RT (ms)") + theme_grey(base_size = 12) + theme(axis.text.x = element_text(size = size_x), axis.text.y = element_text(size = size_y))
+    
+  }
+  
+  return(plot)
+}
+
+
+
+delta_plot <- function(data, delta_interaction = NULL, rt_interaction = NULL, factors = NULL, size_x = 11, size_y = 11){
+  
+  if(is.null(factors) || length(factors) < 1){stop("At least one factor should be specified.")}
+  if(!all(factors %in% names(data))){stop("Not all speficied factors are present in the data.")}
+  
+  #####################
+  ## Estimated values
+  #Converting the interaction into data frame
+  df_interaction <- as.data.frame(delta_interaction)
+    
+  emm_df <- df_interaction %>% select(!!sym(factors[1]), !!sym(factors[2]), delta = emmean, LCL = `lower.CL`, UCL = `upper.CL`)
+  
+  
+  #Getting x-axis: mean RT by quantile by conditions from the RT model
+  meanRT_temp <- summary(rt_interaction) %>% select(TargetType, QQ, meanRT = emmean, x_LCL = `lower.CL`, x_UCL = `upper.CL`) %>% arrange(QQ, TargetType)
+  
+  
+  #Merging delta and rt values
+  delta_mean <- left_join(emm_df, meanRT_temp, by = factors)
+  
+  
+  #######################
+  ## Observed values
+  observed_df <- data %>% group_by(Study, across(all_of(factors))) %>% reframe(delta = mean(delta), meanRT = mean(meanRT)) %>% group_by(across(all_of(factors))) %>% reframe(delta = mean(delta), meanRT = mean(meanRT)) %>% as.data.frame()
+  
+  #PLOT  
+  plot <- ggplot(delta_mean, aes(x = meanRT, y = delta, color = !!sym(factors[1]))) + geom_errorbar(aes(ymin = LCL, ymax = UCL), width = 6) + geom_errorbarh(aes(xmin = x_LCL, xmax = x_UCL), height = 2) + geom_line(linewidth = .5) + geom_point(aes(fill = !!sym(factors[1]), shape = "Estimated"), size = 3, stroke = 1, color = "black") + geom_point(data = observed_df, aes(x = meanRT, y = delta, color = TargetType, shape = "Observed"), size = 4) + scale_color_manual(values = c("#014A94", "#DC6E06", "#004D40")) + scale_fill_manual(values = c("#014A94", "#DC6E06", "#004D40")) + scale_shape_manual(name = "DataType", values = c("Estimated" = 21, "Observed" = 4)) + geom_hline(yintercept = 0, linetype = "dashed", color = "grey30", linewidth = .6) + theme_grey(base_size = 12) + labs(x = "EMM-RT (ms)", y = expression(paste("EMM-", Delta, " (ms)"))) + theme(axis.text.x = element_text(size = size_x), axis.text.y = element_text(size = size_y))
+  
+  return(plot)
+}
+```
+
+
+
+# Load Datasets
+```{r load datasets, echo = FALSE}
+#Load Datasets, change file path accordingly
+# 'M_qq' dataset for RT models
+# 'M_delta' dataset for the delta and trend models
+
+###############################
+#### CDF datasets
+df.M_qq <- read.csv("../datasets/M_qq_df.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+
+df.M_qq_4QQ <- read.csv("../datasets/M_qq_df_4QQ.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+
+df.M_qq_4QQB <- read.csv("../datasets/M_qq_df_4QQB.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+
+df.M_qq_10QQ <- read.csv("../datasets/M_qq_df_10QQ.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows")) %>% reorder_levels(QQ, order = c("q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10"))
+
+df.M_qq_NoTrim <- read.csv("../datasets/M_qq_df_NoTrim.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Congruency, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+
+
+###############################
+#### delta datasets
+df.M_delta <- read.csv("../datasets/M_delta_df.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+
+df.M_delta_4QQ <- read.csv("../datasets/M_delta_df_4QQ.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+
+df.M_delta_4QQB <- read.csv("../datasets/M_delta_df_4QQB.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+
+df.M_delta_10QQ <- read.csv("../datasets/M_delta_df_10QQ.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows")) %>% reorder_levels(QQ, order = c("q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10"))
+
+df.M_delta_NoTrim <- read.csv("../datasets/M_delta_df_NoTrim.csv", header = T, sep = ";", dec = ",") %>% convert_as_factor(id, TargetType, Study, QQ) %>% reorder_levels(TargetType, order = c("Face", "Eyes", "Arrows"))
+```
+
+
+# ...................
+# MODELLING
+## RT Model
+```{r QQ model, echo = FALSE}
+#Saturated Model
+M_qq_saturated <- lmer(RT ~ TargetType * Congruency * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:QQ), data = df.M_qq, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6))) #Both 4qq and 10qq models displayed equivalent patterns
+
+step(M_qq_saturated) #Perform stepwise analyses
+ranova(M_qq_saturated) #Check for the significancy of the random parameters
+
+
+#Best Fit from saturated Model after using a stepwise approach and the ranova function for the random parameters.
+M_qq <- lmer(RT ~ TargetType * Congruency + TargetType * QQ + Congruency * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:QQ), data = df.M_qq, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+# 4 & 10 qq Models
+M_qq_4QQ <- lmer(RT ~ TargetType * Congruency + TargetType * QQ + Congruency * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:QQ), data = df.M_qq_4QQ, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+M_qq_4QQB <- lmer(RT ~ TargetType * Congruency + TargetType * QQ + Congruency * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:QQ), data = df.M_qq_4QQB, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+M_qq_10QQ <- lmer(RT ~ TargetType * Congruency + TargetType * QQ + Congruency * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:QQ), data = df.M_qq_10QQ, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+anova(M_qq, M_qq_saturated) #Comparison between models
+ranova(M_qq)
+
+#save models
+#save(M_qq_10QQ, file = "QQ_Analyses/models/M_qq_10QQ.RData")
+```
+
+
+## Delta Model
+```{r delta model, echo = FALSE}
+###########################
+#### SATURATED MODEL
+M_delta_saturated <- lmer(delta ~ TargetType * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:QQ), data = df.M_delta, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+ranova(M_delta_saturated)
+step(M_delta_saturated)
+
+
+
+#Selected model after ranova and stepwise: it allowed the saturated model
+M_delta <- lmer(delta ~ TargetType * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:QQ), data = df.M_delta, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6))) 
+
+ranova(M_delta)
+
+
+# 4 & 10 qq Models
+M_delta_4QQ <- lmer(delta ~ TargetType * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:QQ), data = df.M_delta_4QQ, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+M_delta_4QQB <- lmer(delta ~ TargetType * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:QQ), data = df.M_delta_4QQB, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+M_delta_10QQ <- lmer(delta ~ TargetType * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:QQ), data = df.M_delta_10QQ, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6))) 
+
+
+#save models
+#save(M_delta_4QQB, file = "QQ_Analyses/models/M_delta_4QQB.RData")
+```
+
+
+## Trend Model
+```{r trend models, echo = FALSE}
+#Polyomial contrast analysis (degree = 2)
+M_trend <- lmer(delta ~ TargetType * poly(meanRT, degree = 2) + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:meanRT), data = df.M_delta, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+
+M_trend_4QQ <- lmer(delta ~ TargetType * poly(meanRT, degree = 2) + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:meanRT), data = df.M_delta_4QQ, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+M_trend_4QQB <- lmer(delta ~ TargetType * poly(meanRT, degree = 2) + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:meanRT), data = df.M_delta_4QQB, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+M_trend_10QQ <- lmer(delta ~ TargetType * poly(meanRT, degree = 2) + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:meanRT), data = df.M_delta_10QQ, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+
+#save models
+#save(M_trend_10QQ, file = "QQ_Analyses/models/M_trend_10QQ.RData")
+```
+
+
+
+# ...................
+# ESTIMATIONS
+##EMM QQ
+```{r emm, echo = FALSE}
+################
+### QQ - RT Model
+
+# Interaction : ~TargetType * Congruency
+EMM_qq_TC <- emmeans(M_qq, ~TargetType * Congruency)
+
+
+# Interaction: ~TargetType * QQ
+EMM_qq_TQQ <- emmeans(M_qq, ~TargetType * QQ)
+
+# 4QQ, 10QQ & NoTrim EMMs: principally to generate the delta plots
+EMM_qq_TQQ_4QQ <- emmeans(M_qq_4QQ, ~TargetType * QQ)
+EMM_qq_TQQ_4QQB <- emmeans(M_qq_4QQB, ~TargetType * QQ)
+EMM_qq_TQQ_10QQ <- emmeans(M_qq_10QQ, ~TargetType * QQ)
+
+
+#Interaction: ~Congruency * QQ
+EMM_qq_CQQ <- emmeans(M_qq, ~Congruency * QQ)
+
+
+
+# MAIN EFFECTS-----
+##Target Type
+EMM_qq_MainEff_TT <- emmeans(M_qq, specs = ~TargetType)
+
+##Congruency
+EMM_qq_MainEff_C <- emmeans(M_qq, specs = ~Congruency)
+
+##QQ
+EMM_qq_MainEff_QQ <- emmeans(M_qq, specs = ~QQ)
+
+
+
+#Save 
+#save(EMM_qq_TQQ_4QQB, file = "QQ_Analyses/emm/EMM_qq_TQQ_4QQB.RData")
+```
+
+
+##EMM Delta
+```{r emm delta, echo = FALSE}
+################
+### DELTA
+EMM_delta <- emmeans(M_delta, ~TargetType * QQ)
+
+# 4 & 6 QQ EMM
+EMM_delta_4QQ <- emmeans(M_delta_4QQ, ~TargetType * QQ)
+EMM_delta_4QQB <- emmeans(M_delta_4QQB, ~TargetType * QQ)
+EMM_delta_10QQ <- emmeans(M_delta_10QQ, ~TargetType * QQ)
+
+
+
+####################
+# AGAINST ZERO
+
+#To test againts zero
+EMM_delta_zero <- emmeans(M_delta, ~TargetType|QQ)
+
+
+# 4 & 10 QQ EMM
+EMM_delta_zero_4QQ <- emmeans(M_delta_4QQ, ~TargetType|QQ)
+EMM_delta_zero_4QQB <- emmeans(M_delta_4QQB, ~TargetType|QQ)
+EMM_delta_zero_10QQ <- emmeans(M_delta_10QQ, ~TargetType|QQ)
+
+
+
+######################
+# MAIN EFFECTS-----
+##Target Type
+EMM_delta_MainEff_TT <- emmeans(M_delta, specs = ~TargetType)
+
+##Congruency
+EMM_delta_MainEff_QQ <- emmeans(M_delta, specs = ~QQ)
+
+
+#Save 
+#save(EMM_delta_4QQB, file = "QQ_Analyses/emm/EMM_delta_4QQB.RData")
+```
+
+
+##EMM Trend
+```{r emm trend, echo = FALSE}
+EMM_trend <- emtrends(M_trend, ~TargetType, var = "meanRT", max.degree = 2)
+
+EMM_trend_4QQ <- emtrends(M_trend_4QQ, ~TargetType, var = "meanRT", max.degree = 2)
+
+EMM_trend_4QQB <- emtrends(M_trend_4QQB, ~TargetType, var = "meanRT", max.degree = 2)
+
+EMM_trend_10QQ <- emtrends(M_trend_10QQ, ~TargetType, var = "meanRT", max.degree = 2)
+
+
+#Estimation for contrast analyses
+EMM_trend_Estimates <- emmeans(M_trend, ~TargetType)
+
+#Save 
+#save(EMM_trend_10QQ, file = "QQ_Analyses/emm/EMM_trend_10QQ.RData")
+```
+
+
+
+# ...................
+#ANOVAs & PES
+```{r anovas, echo = FALSE}
+anova(M_qq)
+eta_sq(M_qq) #Partial eta squared
+
+anova(M_delta)
+eta_sq(M_delta) #Partial eta squared
+
+anova(M_delta_4QQ) #No differences: Equivalent patterns
+anova(M_delta_4QQB) #No differences: Equivalent patterns
+anova(M_delta_10QQ) #No differences: Equivalent patterns
+```
+
+
+# CONTRASTS
+
+## RT Model 
+```{r qq interactions, echo = FALSE}
+####################
+### INTERACTIONS
+
+# Contrast: ~TargetType|Congruency
+Contrast_qq_TC <- pairs(EMM_qq_TC, by = "Congruency", adjust = "tukey", infer = c(TRUE, TRUE)) #Principal
+Contrast_qq_CT <- pairs(EMM_qq_TC, by = "TargetType", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+## Contrast: ~TargetType|qq
+Contrast_qq_TQQ <- pairs(EMM_qq_TQQ, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+## Contrast C: ~Congruency|QQ
+Contrast_qq_CQQ <- pairs(EMM_qq_CQQ, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+
+#####################
+### MAIN EFFECTS
+
+## TargetType
+Contrast_qq_TT <- contrast(EMM_qq_MainEff_TT, method = "tukey", adjust = "tukey")
+
+## Congruency
+Contrast_qq_C <- contrast(EMM_qq_MainEff_C, method = "tukey", adjust = "tukey")
+
+## QQ
+Contrast_qq_QQ <- contrast(EMM_qq_MainEff_QQ, method = "tukey", adjust = "tukey")
+
+
+
+# Transform into dataframe for better visualization, change the name accordingly
+df_contrast <- summary(Contrast_qq_TC)
+
+df_out <- df_contrast %>% select(contrast, Congruency, estimate, SE, LCL = `lower.CL`, UCL = `upper.CL`, t = `t.ratio`, p = `p.value`) %>% mutate(estimate = round(estimate, 3), SE = round(SE, 3), LCL = round(LCL, 2), UCL = round(UCL, 2), t = round(t, 2), p = round(p, 3)) %>% arrange(Congruency)
+
+df_out
+```
+
+
+## Delta Model
+```{r delta interactions, echo = FALSE}
+#####################
+### INTERACTION
+
+Contrast_delta_QQ <- pairs(EMM_delta, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE))
+Contrast_delta_TT <- pairs(EMM_delta, by = "TargetType", adjust = "tukey", infer = c(TRUE, TRUE))
+
+Contrast_delta_QQ_4QQ <- pairs(EMM_delta_4QQ, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE))
+Contrast_delta_QQ_4QQB <- pairs(EMM_delta_4QQB, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE))
+Contrast_delta_QQ_10QQ <- pairs(EMM_delta_10QQ, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE))
+
+Contrast_delta_TT_4QQ <- pairs(EMM_delta_4QQ, by = "TargetType", adjust = "tukey", infer = c(TRUE, TRUE))
+Contrast_delta_TT_10QQ <- pairs(EMM_delta_10QQ, by = "TargetType", adjust = "tukey", infer = c(TRUE, TRUE))
+
+
+
+#######################
+## One-sample: against zero
+Contrast_delta_zero <- summary(EMM_delta_zero, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+
+Contrast_delta_zero_4QQ <- summary(EMM_delta_zero_4QQ, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+Contrast_delta_zero_4QQB <- summary(EMM_delta_zero_4QQB, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+Contrast_delta_zero_10QQ <- summary(EMM_delta_zero_10QQ, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+
+
+
+#####################
+### MAIN EFFECTS
+
+## TargetType
+Contrast_ME_delta_TT <- contrast(EMM_delta_MainEff_TT, method = "tukey", adjuts = "tukey", infer = c(TRUE, TRUE))
+
+
+## QQ
+Contrast_ME_delta_QQ <- contrast(EMM_delta_MainEff_QQ, method = "tukey", adjust = "tukey")
+
+
+
+# Transform into dataframe for better visualization, change the name accordingly
+df_contrast <- summary(Contrast_delta_zero)
+
+df_out <- df_contrast %>% select(TargetType, QQ, emmean, SE, LCL = `lower.CL`, UCL = `upper.CL`, t = `t.ratio`, p = `p.value`) %>% mutate(emmean = round(emmean, 3), SE = round(SE, 3), LCL = round(LCL, 2), UCL = round(UCL, 2), t = round(t, 2), p = round(p, 3)) %>% arrange(TargetType)
+
+df_out %>% filter(TargetType == "Eyes" | TargetType == "Face", p < 0.06)
+```
+
+
+
+## Trend Model
+```{r slope analyses, echo = FALSE}
+#Analysing if the coefficients are significantly different from zero
+trend <- summary(EMM_trend, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+
+trend_4QQ <- summary(EMM_trend_4QQ, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+
+trend_10QQ <- summary(EMM_trend_10QQ, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+
+
+#Comparisons between target types
+trend_pws_tt <- emtrends(M_trend, pairwise ~ TargetType, var = "meanRT", max.degree = 2)
+
+trend_pws_tt_4QQ <- emtrends(M_trend_4QQ, pairwise ~ TargetType, var = "meanRT", max.degree = 2)
+
+trend_pws_tt_4QQB <- emtrends(M_trend_4QQB, pairwise ~ TargetType, var = "meanRT", max.degree = 2)
+
+trend_pws_tt_10QQ <- emtrends(M_trend_10QQ, pairwise ~ TargetType, var = "meanRT", max.degree = 2)
+
+
+
+# Pairwise comparisons with Bonferroni adjustment
+emmeans_delta <- emmeans(M_slope, pairwise ~ TargetType, adjust = "tukey")
+
+
+# Transform into dataframe for better visualization, change the name accordingly
+df <- trend %>% select(degree, TargetType, coeff = meanRT.trend, SE, LCL = lower.CL, UCL = upper.CL, t.ratio, p.value) %>% mutate(coeff = round(coeff, 4), SE = round(SE, 5), LCL = round(LCL, 4), UCL = round(UCL, 4), t.ratio = round(t.ratio, 2), p.value = round(p.value, 4))
+
+df
+```
+
+
+## Eff Sizes
+```{r westfall effect size, echo = FALSE}
+#Parameters: model, contrast (change accordingly)
+westfall.effsize(M_delta, Contrast_delta_zero) %>% arrange(TargetType)
+```
+
+
+
+# ...................
+# PLOTS
+## QQ
+```{r cdf plot, echo = FALSE, fig.height = 3.6, fig.width = 5.2}
+#size: 3.6 x 5.2
+qq_plot(df.M_qq, EMM_qq_TQQ, c("TargetType", "QQ"), size_x = 12, size_y = 11)
+qq_plot(df.M_qq, EMM_qq_TC, c("TargetType", "Congruency"), size_x = 11, size_y = 11)
+qq_plot(df.M_qq, EMM_qq_CQQ, c("Congruency", "QQ"), size_x = 11, size_y = 11)
+```
+
+
+
+## Delta
+```{r delta plot, echo = FALSE, fig.height = 3.6, fig.width = 5.2}
+#Size: h 3.5, w 5.4
+delta_plot(df.M_delta, EMM_delta, EMM_qq_TQQ, c("TargetType", "QQ"), size_x = 11, size_y = 11)
+delta_plot(df.M_delta_NoTrim, EMM_delta_NoTrim, EMM_qq_TQQ_NoTrim, c("TargetType", "QQ"), size_x = 11, size_y = 11)
+
+
+delta_plot(df.M_delta_4QQ, EMM_delta_4QQ, EMM_qq_TQQ_4QQ, c("TargetType", "QQ"), size_x = 11, size_y = 11)
+delta_plot(df.M_delta_4QQB, EMM_delta_4QQB, EMM_qq_TQQ_4QQB, c("TargetType", "QQ"), size_x = 11, size_y = 11)
+
+delta_plot(df.M_delta_10QQ, EMM_delta_10QQ, EMM_qq_TQQ_10QQ, c("TargetType", "QQ"), size_x = 11, size_y = 11)
+```
+
+
+
+# ...................
+# NON-TRIMMED Analyses
+## Modelling
+```{r lmm noTrim, echo = FALSE}
+###################
+## RT Model
+
+M_qq_saturated_NoTrim <- lmer(RT ~ TargetType * Congruency * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:QQ), data = df.M_qq_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+step(M_qq_saturated_NoTrim)
+
+
+
+#Best Fit from saturated Model after using a stepwise approach and the ranova function for the random parameters.
+M_qq_NoTrim <- lmer(RT ~ TargetType * Congruency + TargetType * QQ + Congruency * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:Congruency:QQ), data = df.M_qq_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+#RESULTS: No differences in terms of best fittings
+
+
+
+
+###################
+## DELTA
+
+###########################
+#### SATURATED MODEL
+M_delta_saturated_NoTrim <- lmer(delta ~ TargetType * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:QQ), data = df.M_delta_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+step(M_delta_saturated_NoTrim)
+
+
+#Selected model after ranova and stepwise: it allowed the saturated model
+M_delta_NoTrim <- lmer(delta ~ TargetType * QQ + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:QQ), data = df.M_delta_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+#RESULTS: No differences in terms of best fittings
+
+anova(M_delta_NoTrim) #No differences: Equivalent patterns
+
+
+###################
+## TREND
+M_trend_NoTrim <- lmer(delta ~ TargetType * poly(meanRT, degree = 2) + (1|Study:id) + (1|Study:TargetType) + (1|Study:TargetType:meanRT), data = df.M_delta_NoTrim, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e6)))
+
+
+#save models
+#save(M_trend_NoTrim, file = "QQ_Analyses/models/M_trend_NoTrim.RData")
+```
+
+
+## EMM 
+```{r emm NoTrim, echo = FALSE}
+################
+### QQ
+
+# No Trim Interactions
+EMM_qq_TC_NoTrim <- emmeans(M_qq_NoTrim, ~TargetType * Congruency)
+
+# Interaction: ~TargetType * QQ
+EMM_qq_TQQ_NoTrim <- emmeans(M_qq_NoTrim, ~TargetType * QQ)
+
+#Interaction: ~Congruency * QQ
+EMM_qq_CQQ_NoTrim <- emmeans(M_qq_NoTrim, ~Congruency * QQ)
+
+
+
+
+################
+### DELTA
+EMM_delta_NoTrim <- emmeans(M_delta_NoTrim, ~TargetType * QQ)
+
+#To test againts zero
+EMM_delta_zero_NoTrim <- emmeans(M_delta_NoTrim, ~TargetType|QQ)
+
+
+
+################
+### TREND
+EMM_trend_NoTrim <- emtrends(M_trend_NoTrim, ~TargetType, var = "meanRT", max.degree = 2)
+
+#Save contrasts
+#save(EMM_trend_NoTrim, file = "QQ_Analyses/emm/EMM_trend_NoTrim.RData")
+```
+
+
+
+## Contrasts
+```{r contrast NoTrim, echo = FALSE}
+###RESULSTS: No differences were observed regarding the overal patterns when compared with the trimmed models: M_qq, M_delta, and M_tredn
+
+
+
+####################
+### RT Model
+
+# Contrast: ~TargetType|Congruency
+Contrast_qq_TC_NoTrim <- pairs(EMM_qq_TC_NoTrim, by = "Congruency", adjust = "tukey", infer = c(TRUE, TRUE)) #EQUIVALENT PATTERNS
+
+
+
+## Contrast: ~TargetType|qq
+Contrast_qq_TQQ_NoTrim <- pairs(EMM_qq_TQQ_NoTrim, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE)) #EQUIVALENT PATTERNS
+
+
+
+## Contrast C: ~Congruency|QQ
+Contrast_qq_CQQ_NoTrim <- pairs(EMM_qq_CQQ_NoTrim, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE)) #EQUIVALENT PATTERNS
+
+
+
+
+#####################
+### DELTA
+Contrast_delta_QQ_NoTrim <- pairs(EMM_delta_NoTrim, by = "QQ", adjust = "tukey", infer = c(TRUE, TRUE)) # EQUIVALENT PATTERNS
+
+Contrast_delta_TT_NoTrim <- pairs(EMM_delta_NoTrim, by = "TargetType", adjust = "tukey", infer = c(TRUE, TRUE)) #EQUIVALENT PATTERNS
+
+
+#######################
+## One-sample: against zero
+Contrast_delta_zero_NoTrim <- summary(EMM_delta_zero_NoTrim, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni") #EQUIVALENT PATTERNS
+
+
+
+
+
+#####################
+### TREND
+trend_NoTrim <- summary(EMM_trend_NoTrim, infer = c(TRUE, TRUE), null = 0, adjust = "bonferroni")
+
+#Comparisons between target types
+trend_pws_tt_NoTrim <- emtrends(M_trend_NoTrim, pairwise ~ TargetType, var = "meanRT", max.degree = 2)
+```
+
+
